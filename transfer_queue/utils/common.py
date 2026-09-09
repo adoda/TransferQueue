@@ -14,7 +14,9 @@
 # limitations under the License.
 
 import os
+from collections.abc import Mapping
 from contextlib import contextmanager
+from typing import Any
 
 import psutil
 import ray
@@ -133,3 +135,22 @@ def get_env_bool(env_key: str, default: bool = False) -> bool:
 
     true_values = {"true", "1", "yes", "y", "on"}
     return env_value_lower in true_values
+
+
+def estimate_payload_bytes(field_data: Any) -> int:
+    """Best-effort size of a request payload in bytes; 0 when it cannot be measured.
+
+    Walks two levels: covers both put's ``field -> value`` and get's ``field -> per-sample list``.
+    """
+    total = 0
+    try:
+        values = field_data.values() if isinstance(field_data, Mapping) else field_data
+        for value in values:
+            items = value if isinstance(value, list | tuple) else [value]
+            for item in items:
+                nbytes = getattr(item, "nbytes", None)
+                if isinstance(nbytes, int):
+                    total += nbytes
+    except Exception:
+        return 0
+    return total

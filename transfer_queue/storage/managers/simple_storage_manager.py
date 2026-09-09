@@ -18,6 +18,7 @@ import os
 import warnings
 from collections import defaultdict
 from collections.abc import Mapping
+from functools import partial
 from operator import itemgetter
 from pathlib import Path
 from typing import Any, Callable, NamedTuple
@@ -30,6 +31,7 @@ from tensordict import NonTensorStack, TensorDict
 from transfer_queue.metadata import BatchMeta, extract_field_schema
 from transfer_queue.storage.managers.base import StorageManager, StorageManagerFactory
 from transfer_queue.storage.simple_storage import KEY_NOT_FOUND_MARKER, StorageKeyNotFoundError
+from transfer_queue.utils.common import estimate_payload_bytes
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
@@ -41,6 +43,21 @@ from transfer_queue.utils.zmq_utils import (
 logger = get_logger(__name__)
 
 TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT = int(os.environ.get("TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT", 200))  # seconds
+
+# Attempts per storage-unit request, including the first. Each one must use a new connection: a
+# DEALER silently queues messages for a peer it never reached, so no timeout can catch that.
+TQ_SIMPLE_STORAGE_MAX_ATTEMPTS = int(os.environ.get("TQ_SIMPLE_STORAGE_MAX_ATTEMPTS", 3))
+
+# Timeout for the post-failure probe, which only has to answer whether the unit still serves.
+TQ_SIMPLE_STORAGE_PROBE_TIMEOUT = int(os.environ.get("TQ_SIMPLE_STORAGE_PROBE_TIMEOUT", 10))
+
+
+class StorageUnitTimeout(RuntimeError):
+    """A storage unit did not answer within the send/recv timeout.
+
+    Distinct from an error the unit reported: only a missing answer is worth a new connection.
+    """
+
 
 _SU_SUBDIR = "simple_storage"
 _SU_INFO_FILE = "storage_unit_info.json"
@@ -55,6 +72,16 @@ with_storage_unit_socket = with_zmq_socket(
     get_context=lambda self: self.zmq_context,
     resolve_target=lambda args, kwargs: kwargs.get("target_storage_unit"),
     timeout=TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT,
+)
+
+# Same endpoint as above but with the short diagnostic timeout, used only after a failure.
+with_storage_unit_probe_socket = with_zmq_socket(
+    "put_get_socket",
+    get_identity=lambda self: f"{self.storage_manager_id}_probe",
+    get_peer=lambda self, target: self.storage_unit_infos[target],
+    get_context=lambda self: self.zmq_context,
+    resolve_target=lambda args, kwargs: kwargs.get("target_storage_unit"),
+    timeout=TQ_SIMPLE_STORAGE_PROBE_TIMEOUT,
 )
 
 
@@ -143,6 +170,103 @@ class AsyncSimpleStorageManager(StorageManager):
             gi_lists[key].append(global_idx)
             pos_lists[key].append(pos)
         return {key: RoutingGroup(gi_lists[key], pos_lists[key]) for key in gi_lists}
+
+    def _describe_storage_unit(self, storage_unit_id: str) -> str:
+        """Return ``ip:port`` for a storage unit, for use in diagnostics.
+
+        The unit id is a random uuid4 fragment that carries no location, so a bare id in an
+        error message cannot be traced back to a node. Never raises: it is only ever called
+        while reporting another failure, and must not mask it.
+        """
+        info = self.storage_unit_infos.get(storage_unit_id)
+        if info is None:
+            return "endpoint unknown (unit not registered with this manager)"
+        return f"{info.ip}:{info.ports.get('put_get_socket')}"
+
+    @with_storage_unit_probe_socket
+    async def _probe_storage_unit(self, target_storage_unit: str, socket: zmq.Socket = None) -> dict[str, Any]:
+        """Ask a storage unit for its own counters over a brand-new socket.
+
+        Served by the same worker thread as put and get, so an answer proves the unit is serving.
+        """
+        request_msg = ZMQMessage.create(
+            request_type=ZMQRequestType.GET_METRICS,  # type: ignore[arg-type]
+            sender_id=f"{self.storage_manager_id}_probe",
+            receiver_id=target_storage_unit,
+            body={},
+        )
+        await socket.send_multipart(request_msg.serialize())
+        messages = await socket.recv_multipart(copy=False)
+        response_msg = ZMQMessage.deserialize(messages)
+        if response_msg.request_type != ZMQRequestType.METRICS_RESPONSE:
+            raise RuntimeError(f"unexpected probe response type {response_msg.request_type}")
+        return response_msg.body
+
+    async def _diagnose_storage_unit(self, target_storage_unit: str) -> str:
+        """Classify a timeout as a lost request, a stuck unit, or an unreachable node.
+
+        Returns one log line and never raises: it runs while another failure is being reported.
+        """
+        info = self.storage_unit_infos.get(target_storage_unit)
+        if info is None:
+            return "verdict=unknown(unit_not_registered)"
+
+        try:
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(info.ip, info.ports.get("put_get_socket")), timeout=5
+            )
+            writer.close()
+            tcp = "tcp=up"
+        except Exception as e:
+            tcp = f"tcp=down({type(e).__name__})"
+
+        try:
+            body = await self._probe_storage_unit(target_storage_unit=target_storage_unit)
+            op_counts = {op: stats.get("request_count") for op, stats in (body.get("op_stats") or {}).items()}
+            return (
+                f"{tcp} verdict=request_lost_in_flight (unit answered a fresh probe: "
+                f"ops={op_counts} active_keys={body.get('active_keys')} "
+                f"rss_gb={body.get('process_rss_bytes', 0) / 2**30:.2f})"
+            )
+        except zmq.error.Again:
+            return f"{tcp} verdict=unit_not_serving (no probe answer in {TQ_SIMPLE_STORAGE_PROBE_TIMEOUT}s)"
+        except Exception as e:
+            return f"{tcp} verdict=unknown (probe failed: {type(e).__name__}: {e})"
+
+    async def _request_with_retry(
+        self,
+        operation: str,
+        target_storage_unit: str,
+        request_context: str,
+        make_request: Callable[[], Any],
+    ):
+        """Run one storage-unit request, retrying a missing answer on a fresh connection.
+
+        Args:
+            operation: Operation name for logs, e.g. ``get`` or ``put``.
+            target_storage_unit: Unit this request is routed to.
+            request_context: Request shape, so both ends of a failure can be correlated.
+            make_request: Zero-arg callable returning a coroutine for one attempt. Must build a
+                new socket per call, which ``with_storage_unit_socket`` does.
+        """
+        endpoint = self._describe_storage_unit(target_storage_unit)
+        for attempt in range(1, TQ_SIMPLE_STORAGE_MAX_ATTEMPTS + 1):
+            try:
+                return await make_request()
+            except StorageUnitTimeout:
+                if attempt < TQ_SIMPLE_STORAGE_MAX_ATTEMPTS:
+                    logger.warning(
+                        f"[{self.storage_manager_id}]: no answer from {target_storage_unit} at {endpoint} in "
+                        f"{TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT}s, {operation} retry "
+                        f"{attempt + 1}/{TQ_SIMPLE_STORAGE_MAX_ATTEMPTS}. {request_context}"
+                    )
+                    continue
+                logger.error(
+                    f"[{self.storage_manager_id}]: {operation} to {target_storage_unit} at {endpoint} failed "
+                    f"after {attempt}x{TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT}s. {request_context} "
+                    f"{await self._diagnose_storage_unit(target_storage_unit)}"
+                )
+                raise
 
     @staticmethod
     def _select_by_positions(field_data, positions: list[int]):
@@ -257,24 +381,37 @@ class AsyncSimpleStorageManager(StorageManager):
         field_schema = extract_field_schema(data)
 
         routing = self._group_by_hash(metadata.global_indexes)
-        tasks = [
-            self._put_to_single_storage_unit(
-                group.global_indexes,
-                {f: self._select_by_positions(data[f], group.batch_positions) for f in data.keys()},
-                target_storage_unit=su_id,
-                data_parser=data_parser,
+        # A retried put is replayed as-is: it overwrites the same global indexes, and re-runs
+        # data_parser on the unit, so a parser must be free of external side effects.
+        tasks = []
+        for su_id, group in routing.items():
+            storage_data = {f: self._select_by_positions(data[f], group.batch_positions) for f in data.keys()}
+            tasks.append(
+                self._request_with_retry(
+                    "put",
+                    su_id,
+                    f"samples={len(group.global_indexes)} fields={list(storage_data.keys())} "
+                    f"payload_mb={estimate_payload_bytes(storage_data) / 2**20:.1f}",
+                    partial(
+                        self._put_to_single_storage_unit,
+                        group.global_indexes,
+                        storage_data,
+                        target_storage_unit=su_id,
+                        data_parser=data_parser,
+                    ),
+                )
             )
-            for su_id, group in routing.items()
-        ]
 
         try:
             await asyncio.gather(*tasks)
         except Exception as e:
+            # The offending unit is named in the error itself; the full routing list can run to
+            # hundreds of ids, which buries it.
             logger.error(
                 f"[{self.storage_manager_id}]: put_data failed. "
                 f"partition_id={metadata.partition_ids[0]}, "
                 f"num_samples={metadata.size}, "
-                f"storage_units={list(routing.keys())}, "
+                f"num_storage_units={len(routing)}, "
                 f"error={type(e).__name__}: {e}"
             )
             raise
@@ -318,14 +455,9 @@ class AsyncSimpleStorageManager(StorageManager):
                     f"{response_msg.body.get('message', 'Unknown error')}"
                 )
         except zmq.error.Again as e:
-            timeout_sec = TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT
-            logger.error(
-                f"[{self.storage_manager_id}]: ZMQ recv timeout ({timeout_sec}s) "
-                f"during put to storage unit {target_storage_unit}. "
-                f"The storage unit may be overloaded or crashed."
-            )
-            raise RuntimeError(
-                f"ZMQ recv timeout ({timeout_sec}s) during put to storage unit {target_storage_unit}"
+            raise StorageUnitTimeout(
+                f"no answer in {TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT}s during put to storage unit "
+                f"{target_storage_unit} at {self._describe_storage_unit(target_storage_unit)}"
             ) from e
         except Exception as e:
             logger.error(
@@ -405,7 +537,17 @@ class AsyncSimpleStorageManager(StorageManager):
         routing = self._group_by_hash(metadata.global_indexes)
 
         tasks = [
-            self._get_from_single_storage_unit(group.global_indexes, metadata.field_names, target_storage_unit=su_id)
+            self._request_with_retry(
+                "get",
+                su_id,
+                f"samples={len(group.global_indexes)} fields={list(metadata.field_names)}",
+                partial(
+                    self._get_from_single_storage_unit,
+                    group.global_indexes,
+                    metadata.field_names,
+                    target_storage_unit=su_id,
+                ),
+            )
             for su_id, group in routing.items()
         ]
         try:
@@ -464,13 +606,10 @@ class AsyncSimpleStorageManager(StorageManager):
                 error_type = StorageKeyNotFoundError if KEY_NOT_FOUND_MARKER in message else RuntimeError
                 raise error_type(f"Failed to get data from storage unit {target_storage_unit}: {message}")
         except zmq.error.Again as e:
-            timeout_sec = TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT
-            logger.error(
-                f"[{self.storage_manager_id}]: ZMQ recv timeout ({timeout_sec}s) "
-                f"from storage unit {target_storage_unit}. "
-                f"The storage unit may be overloaded or crashed."
-            )
-            raise RuntimeError(f"ZMQ recv timeout ({timeout_sec}s) from storage unit {target_storage_unit}") from e
+            raise StorageUnitTimeout(
+                f"no answer in {TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT}s from storage unit "
+                f"{target_storage_unit} at {self._describe_storage_unit(target_storage_unit)}"
+            ) from e
         except StorageKeyNotFoundError:
             # Already logged at debug by the storage unit; propagate for the caller to classify.
             raise
