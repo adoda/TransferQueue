@@ -86,6 +86,23 @@ async def test_retry_gives_up_after_configured_attempts():
 
 
 @pytest.mark.asyncio
+async def test_a_nonpositive_attempt_count_still_issues_one_request():
+    """Skipping the request would report success, and let put_data publish absent data."""
+    manager = _manager(unit_a=_server_info("unit_a", "10.0.0.7", 5555))
+    attempts = []
+
+    async def succeed():
+        attempts.append(1)
+        return "payload"
+
+    with patch.object(ssm, "TQ_SIMPLE_STORAGE_MAX_ATTEMPTS", 0):
+        result = await manager._request_with_retry("get", "unit_a", "samples=4", succeed)
+
+    assert result == "payload"
+    assert len(attempts) == 1
+
+
+@pytest.mark.asyncio
 async def test_errors_reported_by_the_unit_are_not_retried():
     """Only a missing answer is worth another connection; a real error must surface at once."""
     manager = _manager(unit_a=_server_info("unit_a", "10.0.0.7", 5555))

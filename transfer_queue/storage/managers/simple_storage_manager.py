@@ -250,15 +250,18 @@ class AsyncSimpleStorageManager(StorageManager):
                 new socket per call, which ``with_storage_unit_socket`` does.
         """
         endpoint = self._describe_storage_unit(target_storage_unit)
-        for attempt in range(1, TQ_SIMPLE_STORAGE_MAX_ATTEMPTS + 1):
+        # Floored at one: a nonpositive count would skip the request and report success, which for
+        # put would publish metadata for data that was never sent.
+        attempts_allowed = max(1, TQ_SIMPLE_STORAGE_MAX_ATTEMPTS)
+        for attempt in range(1, attempts_allowed + 1):
             try:
                 return await make_request()
             except StorageUnitTimeout:
-                if attempt < TQ_SIMPLE_STORAGE_MAX_ATTEMPTS:
+                if attempt < attempts_allowed:
                     logger.warning(
                         f"[{self.storage_manager_id}]: no answer from {target_storage_unit} at {endpoint} in "
                         f"{TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT}s, {operation} retry "
-                        f"{attempt + 1}/{TQ_SIMPLE_STORAGE_MAX_ATTEMPTS}. {request_context}"
+                        f"{attempt + 1}/{attempts_allowed}. {request_context}"
                     )
                     continue
                 logger.error(
