@@ -239,6 +239,7 @@ class AsyncSimpleStorageManager(StorageManager):
         target_storage_unit: str,
         request_context: str,
         make_request: Callable[[], Any],
+        max_attempts: int | None = None,
     ):
         """Run one storage-unit request, retrying a missing answer on a fresh connection.
 
@@ -248,11 +249,13 @@ class AsyncSimpleStorageManager(StorageManager):
             request_context: Request shape, so both ends of a failure can be correlated.
             make_request: Zero-arg callable returning a coroutine for one attempt. Must build a
                 new socket per call, which ``with_storage_unit_socket`` does.
+            max_attempts: Attempts allowed. Defaults to ``TQ_SIMPLE_STORAGE_MAX_ATTEMPTS``; pass 1
+                for a request that must not be replayed.
         """
         endpoint = self._describe_storage_unit(target_storage_unit)
         # Floored at one: a nonpositive count would skip the request and report success, which for
         # put would publish metadata for data that was never sent.
-        attempts_allowed = max(1, TQ_SIMPLE_STORAGE_MAX_ATTEMPTS)
+        attempts_allowed = max(1, TQ_SIMPLE_STORAGE_MAX_ATTEMPTS if max_attempts is None else max_attempts)
         for attempt in range(1, attempts_allowed + 1):
             try:
                 return await make_request()
@@ -384,8 +387,10 @@ class AsyncSimpleStorageManager(StorageManager):
         field_schema = extract_field_schema(data)
 
         routing = self._group_by_hash(metadata.global_indexes)
-        # A retried put is replayed as-is: it overwrites the same global indexes, and re-runs
-        # data_parser on the unit, so a parser must be free of external side effects.
+        # Replaying a put is safe because it overwrites the same global indexes, but a retry also
+        # re-runs data_parser on the unit, and the public API does not require a parser to be free
+        # of side effects. So a parser-backed put is sent once and fails as it did before.
+        max_attempts = 1 if data_parser is not None else None
         tasks = []
         for su_id, group in routing.items():
             storage_data = {f: self._select_by_positions(data[f], group.batch_positions) for f in data.keys()}
@@ -402,6 +407,7 @@ class AsyncSimpleStorageManager(StorageManager):
                         target_storage_unit=su_id,
                         data_parser=data_parser,
                     ),
+                    max_attempts=max_attempts,
                 )
             )
 

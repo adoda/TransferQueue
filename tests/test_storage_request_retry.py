@@ -16,12 +16,15 @@
 """Tests for storage-unit request retry and the timeout diagnosis that classifies a failure."""
 
 import logging
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
+import numpy as np
 import pytest
 import torch
 import zmq
+from tensordict import TensorDict
 
+from transfer_queue.metadata import BatchMeta
 from transfer_queue.storage.managers import simple_storage_manager as ssm
 from transfer_queue.storage.managers.simple_storage_manager import (
     AsyncSimpleStorageManager,
@@ -37,11 +40,52 @@ def _manager(**units: ZMQServerInfo) -> AsyncSimpleStorageManager:
     manager = AsyncSimpleStorageManager.__new__(AsyncSimpleStorageManager)
     manager.storage_manager_id = "TQ_STORAGE_test"
     manager.storage_unit_infos = dict(units)
+    manager.close = lambda: None  # __init__ is skipped, so there is no socket or thread to close
     return manager
 
 
 def _server_info(unit_id: str, ip: str, port: int) -> ZMQServerInfo:
     return ZMQServerInfo(role=Role.STORAGE, id=unit_id, ip=ip, ports={"put_get_socket": port})
+
+
+def _single_sample_batch() -> tuple[TensorDict, BatchMeta]:
+    """One sample routed to one unit, the smallest input put_data accepts."""
+    metadata = BatchMeta(
+        global_indexes=[0],
+        partition_ids=["0"],
+        field_schema={"input_ids": {"dtype": torch.int64, "shape": (2,), "is_nested": False, "is_non_tensor": False}},
+        production_status=np.ones(1, dtype=np.int8),
+    )
+    return TensorDict({"input_ids": torch.zeros(1, 2, dtype=torch.int64)}, batch_size=1), metadata
+
+
+async def _failing_put_attempts(data_parser) -> int:
+    """Count the attempts put_data makes when the unit never answers."""
+    manager = _manager(unit_a=_server_info("unit_a", "10.0.0.7", 5555))
+    manager.notify_data_update = AsyncMock()
+    manager._put_to_single_storage_unit = AsyncMock(side_effect=StorageUnitTimeout("no answer"))
+    data, metadata = _single_sample_batch()
+
+    with (
+        patch.object(manager, "_diagnose_storage_unit", return_value="diagnosis"),
+        pytest.raises(StorageUnitTimeout),
+    ):
+        await manager.put_data(data, metadata, data_parser=data_parser)
+
+    manager.notify_data_update.assert_not_awaited()
+    return manager._put_to_single_storage_unit.await_count
+
+
+@pytest.mark.asyncio
+async def test_parser_backed_put_is_not_replayed():
+    """A parser re-runs on the unit, and the public API does not constrain its side effects."""
+    assert await _failing_put_attempts(data_parser=lambda field_data: field_data) == 1
+
+
+@pytest.mark.asyncio
+async def test_put_without_a_parser_is_still_retried():
+    """The retry must stay in force for the ordinary put, which is a plain overwrite."""
+    assert await _failing_put_attempts(data_parser=None) == ssm.TQ_SIMPLE_STORAGE_MAX_ATTEMPTS
 
 
 @pytest.mark.asyncio
