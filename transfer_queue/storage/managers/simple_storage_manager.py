@@ -31,12 +31,12 @@ from tensordict import NonTensorStack, TensorDict
 from transfer_queue.metadata import BatchMeta, extract_field_schema
 from transfer_queue.storage.managers.base import StorageManager, StorageManagerFactory
 from transfer_queue.storage.simple_storage import KEY_NOT_FOUND_MARKER, StorageKeyNotFoundError
-from transfer_queue.utils.common import estimate_payload_bytes
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
     ZMQServerInfo,
+    frame_nbytes,
     with_zmq_socket,
 )
 
@@ -259,17 +259,17 @@ class AsyncSimpleStorageManager(StorageManager):
         for attempt in range(1, attempts_allowed + 1):
             try:
                 return await make_request()
-            except StorageUnitTimeout:
+            except StorageUnitTimeout as e:
                 if attempt < attempts_allowed:
                     logger.warning(
                         f"[{self.storage_manager_id}]: no answer from {target_storage_unit} at {endpoint} in "
                         f"{TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT}s, {operation} retry "
-                        f"{attempt + 1}/{attempts_allowed}. {request_context}"
+                        f"{attempt + 1}/{attempts_allowed}. {request_context} {e}"
                     )
                     continue
                 logger.error(
                     f"[{self.storage_manager_id}]: {operation} to {target_storage_unit} at {endpoint} failed "
-                    f"after {attempt}x{TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT}s. {request_context} "
+                    f"after {attempt}x{TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT}s. {request_context} {e} "
                     f"{await self._diagnose_storage_unit(target_storage_unit)}"
                 )
                 raise
@@ -396,8 +396,7 @@ class AsyncSimpleStorageManager(StorageManager):
                 self._request_with_retry(
                     "put",
                     su_id,
-                    f"samples={len(group.global_indexes)} fields={list(storage_data.keys())} "
-                    f"payload_mb={estimate_payload_bytes(storage_data) / 2**20:.1f}",
+                    f"samples={len(group.global_indexes)} fields={list(storage_data.keys())}",
                     partial(
                         self._put_to_single_storage_unit,
                         group.global_indexes,
@@ -450,9 +449,11 @@ class AsyncSimpleStorageManager(StorageManager):
             body={"global_indexes": global_indexes, "data": storage_data, "data_parser": data_parser},
         )
 
+        serialized_bytes = 0
         try:
-            data = request_msg.serialize()
-            await socket.send_multipart(data, copy=False)
+            frames = request_msg.serialize()
+            serialized_bytes = sum(frame_nbytes(frame) or 0 for frame in frames)
+            await socket.send_multipart(frames, copy=False)
             messages = await socket.recv_multipart(copy=False)
             response_msg = ZMQMessage.deserialize(messages)
 
@@ -464,7 +465,8 @@ class AsyncSimpleStorageManager(StorageManager):
         except zmq.error.Again as e:
             raise StorageUnitTimeout(
                 f"no answer in {TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT}s during put to storage unit "
-                f"{target_storage_unit} at {self._describe_storage_unit(target_storage_unit)}"
+                f"{target_storage_unit} at {self._describe_storage_unit(target_storage_unit)}; "
+                f"samples={len(global_indexes)} serialized_mb={serialized_bytes / 2**20:.1f}"
             ) from e
         except Exception as e:
             logger.error(

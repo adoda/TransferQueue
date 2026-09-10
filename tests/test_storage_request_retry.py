@@ -183,6 +183,25 @@ async def test_retry_logs_endpoint_and_request_shape(caplog):
 
 
 @pytest.mark.asyncio
+async def test_retry_logs_timeout_detail(caplog):
+    """The retry warning must carry the size reported by the failed attempt."""
+    manager = _manager(unit_a=_server_info("unit_a", "10.0.0.7", 5555))
+    attempts = []
+
+    async def flaky():
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise StorageUnitTimeout("serialized_mb=12.5")
+        return "payload"
+
+    with caplog.at_level(logging.WARNING):
+        await manager._request_with_retry("put", "unit_a", "samples=4", flaky)
+
+    warning = next(r for r in caplog.records if "retry" in r.message)
+    assert "serialized_mb=12.5" in warning.message
+
+
+@pytest.mark.asyncio
 async def test_diagnosis_blames_the_link_when_the_unit_still_answers():
     """A unit that answers a fresh probe was not the one that stalled."""
     manager = _manager(unit_a=_server_info("unit_a", "10.0.0.7", 5555))
