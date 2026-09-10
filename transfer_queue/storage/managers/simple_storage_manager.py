@@ -38,9 +38,11 @@ from transfer_queue.storage.simple_storage import (
 from transfer_queue.utils.common import log_heavy_operation
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.zmq_utils import (
+    TQ_SOCKET_POOL_SIZE,
     ZMQMessage,
     ZMQRequestType,
     ZMQServerInfo,
+    ZMQSocketPool,
     frame_nbytes,
     with_zmq_socket,
 )
@@ -71,24 +73,16 @@ _SU_INFO_FILE = "storage_unit_info.json"
 
 # Pre-bound decorator for storage-unit socket operations.
 with_storage_unit_socket = with_zmq_socket(
-    "put_get_socket",
-    get_identity=lambda self: self.storage_manager_id,
     get_peer=lambda self, target: self.storage_unit_infos[target],
-    # Long-lived context from the base StorageManager, shared with the notify path. Safe
-    # because the context is loop-agnostic and each socket stays per-call.
-    get_context=lambda self: self.zmq_context,
+    get_pool=lambda self: self.storage_rpc_pool,
     resolve_target=lambda args, kwargs: kwargs.get("target_storage_unit"),
-    timeout=TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT,
 )
 
 # Same endpoint as above but with the short diagnostic timeout, used only after a failure.
 with_storage_unit_probe_socket = with_zmq_socket(
-    "put_get_socket",
-    get_identity=lambda self: f"{self.storage_manager_id}_probe",
     get_peer=lambda self, target: self.storage_unit_infos[target],
-    get_context=lambda self: self.zmq_context,
+    get_pool=lambda self: self.storage_probe_pool,
     resolve_target=lambda args, kwargs: kwargs.get("target_storage_unit"),
-    timeout=TQ_SIMPLE_STORAGE_PROBE_TIMEOUT,
 )
 
 
@@ -114,6 +108,20 @@ class AsyncSimpleStorageManager(StorageManager):
         zmq_context: zmq.asyncio.Context | None = None,
     ):
         super().__init__(controller_info, config, zmq_context=zmq_context)
+        # Storage-unit RPC, on whichever context the base class settled on.
+        self.storage_rpc_pool = ZMQSocketPool(
+            self.zmq_context,
+            self.storage_manager_id,
+            "put_get_socket",
+            timeout=TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT,
+        )
+        self.storage_probe_pool = ZMQSocketPool(
+            self.zmq_context,
+            f"{self.storage_manager_id}_probe",
+            "put_get_socket",
+            timeout=TQ_SIMPLE_STORAGE_PROBE_TIMEOUT,
+            maxsize=1,
+        )
 
         self.config = config
         server_infos: ZMQServerInfo | dict[str, ZMQServerInfo] | None = config.get("zmq_info", None)
@@ -131,6 +139,28 @@ class AsyncSimpleStorageManager(StorageManager):
             raise ValueError("AsyncSimpleStorageManager requires non-empty 'zmq_info' in config.")
 
         self.storage_unit_infos = self._register_servers(server_infos)
+        self._warn_if_pool_can_exhaust_context(len(self.storage_unit_infos))
+
+    def _warn_if_pool_can_exhaust_context(self, num_units: int) -> None:
+        """Warn when the pool may park more sockets than the context can hold.
+
+        The cap is per (owner, address), so it multiplies by storage-unit count while the
+        context ceiling does not. At a few thousand units the product passes ZMQ_MAX_SOCKETS,
+        where a lease fails with EMFILE instead of degrading.
+        """
+        try:
+            budget = self.zmq_context.get(zmq.MAX_SOCKETS)
+        except zmq.ZMQError:  # pragma: no cover - context already terminating
+            return
+        worst_case = (TQ_SOCKET_POOL_SIZE + 1) * num_units
+        if worst_case > budget:
+            logger.warning(
+                f"[{self.storage_manager_id}]: storage RPC pool may hold up to "
+                f"({TQ_SOCKET_POOL_SIZE} + 1 probe) x {num_units} = {worst_case} idle sockets, above this "
+                f"context's ZMQ_MAX_SOCKETS ({budget}). Concurrent requests can then fail to "
+                f"open a socket. Lower TQ_SOCKET_POOL_SIZE or raise TQ_CLIENT_ZMQ_MAX_SOCKETS "
+                f"(with enough file descriptors, see ulimit -n)."
+            )
 
     def _register_servers(self, server_infos: "ZMQServerInfo | dict[Any, ZMQServerInfo]"):
         """Register and validate server information.
@@ -824,4 +854,12 @@ class AsyncSimpleStorageManager(StorageManager):
 
     def close(self) -> None:
         """Close all ZMQ sockets and context to prevent resource leaks."""
+        # Before super(), which may destroy the context these sockets live on. Absent when
+        # the base constructor raised (a failed handshake does), and __del__ still calls this.
+        pool = getattr(self, "storage_rpc_pool", None)
+        if pool is not None:
+            pool.close()
+        probe_pool = getattr(self, "storage_probe_pool", None)
+        if probe_pool is not None:
+            probe_pool.close()
         super().close()

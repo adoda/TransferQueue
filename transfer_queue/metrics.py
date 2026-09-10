@@ -18,7 +18,6 @@ import time
 from contextlib import contextmanager
 from threading import Thread
 from typing import Any
-from uuid import uuid4
 
 import psutil
 import zmq
@@ -30,8 +29,7 @@ from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
     ZMQServerInfo,
-    create_zmq_socket,
-    format_zmq_address,
+    ZMQSocketPool,
 )
 
 logger = get_logger(__name__)
@@ -68,13 +66,22 @@ class TQMetricsExporter:
         TQ_METRICS_STORAGE_TIMEOUT   ZMQ timeout for storage queries (default 5s)
     """
 
-    def __init__(self, role: str = "controller"):
+    def __init__(self, role: str = "controller", zmq_context: zmq.Context | None = None):
+        """
+        Args:
+            role: Which process this exporter runs in; only "controller" collects from
+                storage units, so only that role needs a context.
+            zmq_context: The owner's long-lived synchronous context, borrowed for
+                storage-unit queries and never terminated here. Minting one instead would
+                add a second context and its native I/O thread with nobody to close them,
+                since the exporter lives as long as its Ray actor.
+        """
         self._start_time = time.time()
         self._process = psutil.Process()
         self._role = role
         self._storage_unit_infos: dict[str, ZMQServerInfo] = {}
-        self._zmq_ctx: zmq.Context | None = None
-        self._zmq_sockets: dict[str, zmq.Socket] = {}
+        self._zmq_ctx = zmq_context
+        self._zmq_socket_pool: ZMQSocketPool | None = None
         self._known_partition_ids: set[str] = set()
         self._known_production_labels: set[tuple[str, str]] = set()
         self._known_consumption_labels: set[tuple[str, str]] = set()
@@ -372,49 +379,50 @@ class TQMetricsExporter:
             except Exception as e:
                 logger.warning(f"Failed to collect metrics from storage unit {su_id}: {e}")
 
-    def _get_or_create_socket(self, su_id: str, su_info: ZMQServerInfo) -> zmq.Socket:
-        """Return a cached ZMQ DEALER socket for *su_id*, creating one if needed."""
-        if self._zmq_ctx is None:
-            self._zmq_ctx = zmq.Context()
-
-        sock = self._zmq_sockets.get(su_id)
-        if sock is not None and not sock.closed:
-            return sock
-
-        identity = f"{METRICS_COLLECTOR_IDENTITY_PREFIX}{uuid4().hex[:8]}".encode()
-        sock = create_zmq_socket(self._zmq_ctx, zmq.DEALER, su_info.ip, identity)
-        timeout_ms = TQ_METRICS_STORAGE_TIMEOUT * 1000
-        address = format_zmq_address(su_info.ip, su_info.ports["put_get_socket"])
-        sock.connect(address)
-        sock.setsockopt(zmq.RCVTIMEO, timeout_ms)
-        sock.setsockopt(zmq.SNDTIMEO, timeout_ms)
-        self._zmq_sockets[su_id] = sock
-        return sock
+    def _get_socket_pool(self) -> ZMQSocketPool:
+        """Return the lazily-created socket pool for storage-unit queries."""
+        if self._zmq_socket_pool is None:
+            if self._zmq_ctx is None:
+                raise RuntimeError(
+                    "TQMetricsExporter was built without a ZMQ context, so it cannot query "
+                    "storage units; pass zmq_context= from the owning process."
+                )
+            self._zmq_socket_pool = ZMQSocketPool(
+                self._zmq_ctx,
+                # The storage proxy drops identities without this prefix, and the pool
+                # builds each socket's identity from the owner id.
+                METRICS_COLLECTOR_IDENTITY_PREFIX.rstrip("_"),
+                "put_get_socket",
+                timeout=TQ_METRICS_STORAGE_TIMEOUT,
+            )
+        return self._zmq_socket_pool
 
     def _query_storage_unit(self, su_info: ZMQServerInfo, su_id: str) -> dict[str, Any] | None:
         """Send a synchronous GET_METRICS request to a single storage unit."""
         try:
-            sock = self._get_or_create_socket(su_id, su_info)
-            request_msg = ZMQMessage.create(
-                request_type=ZMQRequestType.GET_METRICS,
-                sender_id="metrics_collector",
-                body={},
-            )
-            sock.send_multipart(request_msg.serialize())
-            response_frames = sock.recv_multipart(copy=False)
-            response_msg = ZMQMessage.deserialize(response_frames)
-            if response_msg.request_type == ZMQRequestType.METRICS_RESPONSE:
-                return response_msg.body
-            return None
+            pool = self._get_socket_pool()
+            with pool.lease(su_info) as sock:
+                request_msg = ZMQMessage.create(
+                    request_type=ZMQRequestType.GET_METRICS,
+                    sender_id="metrics_collector",
+                    body={},
+                )
+                sock.send_multipart(request_msg.serialize())
+                response_frames = sock.recv_multipart(copy=False)
+                response_msg = ZMQMessage.deserialize(response_frames)
+                # Closed rather than parked: collection walks every unit once per cycle, so
+                # a kept socket holds budget for the whole walk to save one handshake.
+                sock.close(linger=0)
+                if response_msg.request_type == ZMQRequestType.METRICS_RESPONSE:
+                    return response_msg.body
+                return None
         except zmq.error.Again:
+            # The pool discarded the socket, so the next cycle starts clean. Reusing it
+            # would read this reply, if it lands late, as the answer to that cycle's query.
             logger.debug(f"Timeout querying metrics from {su_id}")
             return None
         except Exception as e:
             logger.warning(f"Error querying metrics from {su_id}: {e}")
-            # Close broken socket so it gets recreated next cycle
-            sock = self._zmq_sockets.pop(su_id, None)
-            if sock and not sock.closed:
-                sock.close(linger=0)
             return None
 
     def start(self, node_ip: str = "0.0.0.0", port: int = 0) -> str:

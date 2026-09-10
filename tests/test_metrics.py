@@ -16,12 +16,17 @@
 """Unit tests for the Prometheus metrics exporter (transfer_queue.metrics)."""
 
 import time
-from unittest.mock import MagicMock
+from threading import Thread
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 try:
+    import zmq
+
     from transfer_queue.metrics import TQMetricsExporter
+    from transfer_queue.utils.enum_utils import Role
+    from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, ZMQServerInfo
 
     _HAS_DEPS = True
 except (ImportError, OSError):
@@ -205,6 +210,77 @@ class TestMeasureContextManager:
 # ---------------------------------------------------------------------------
 # Test: storage unit metrics collection
 # ---------------------------------------------------------------------------
+
+
+class TestStorageQuerySocketPool:
+    def test_pool_borrows_the_owner_context(self):
+        """The exporter must query storage units over the context it was handed.
+
+        The controller already holds a long-lived synchronous context. A second one would
+        add another native I/O thread and leave a context nobody closes, since the exporter
+        lives for the whole life of its Ray actor.
+        """
+        ctx = zmq.Context()
+        try:
+            exporter = TQMetricsExporter(zmq_context=ctx)
+            with patch("zmq.Context") as minted:
+                exporter._get_socket_pool()
+            minted.assert_not_called()
+        finally:
+            ctx.destroy(linger=0)
+
+    def test_missing_context_is_reported(self):
+        """Without a context there is nothing to query over, so say so rather than mint one."""
+        exporter = TQMetricsExporter()
+        with pytest.raises(RuntimeError, match="without a ZMQ context"):
+            exporter._get_socket_pool()
+
+    def test_collector_parks_no_socket_between_queries(self):
+        """A queried unit must leave nothing in the pool.
+
+        Collection walks every unit once per cycle, so a parked socket is reused only a
+        cycle later while holding a slot in the controller context's budget for the whole
+        walk. At a few thousand units that budget is what runs out first.
+        """
+        identities: set[bytes] = set()
+        ctx_peer = zmq.Context()
+        router = ctx_peer.socket(zmq.ROUTER)
+        port = router.bind_to_random_port("tcp://127.0.0.1")
+        running = True
+
+        def serve():
+            poller = zmq.Poller()
+            poller.register(router, zmq.POLLIN)
+            while running:
+                if not dict(poller.poll(50)):
+                    continue
+                identity, _ = router.recv_multipart()
+                identities.add(bytes(identity))
+                response = ZMQMessage.create(
+                    request_type=ZMQRequestType.METRICS_RESPONSE,
+                    sender_id="storage_0",
+                    body={},
+                )
+                router.send_multipart([identity, *response.serialize()])
+
+        server = Thread(target=serve, daemon=True)
+        server.start()
+
+        su_info = ZMQServerInfo(role=Role.STORAGE, id="storage_0", ip="127.0.0.1", ports={"put_get_socket": port})
+        ctx = zmq.Context()
+        try:
+            exporter = TQMetricsExporter(zmq_context=ctx)
+            for _ in range(3):
+                assert exporter._query_storage_unit(su_info, "storage_0") == {}
+            # A parked socket would be reused, so a fresh identity per query is the
+            # externally visible proof that nothing was kept.
+            assert len(identities) == 3, "a queried unit left its socket in the pool"
+        finally:
+            running = False
+            server.join(timeout=2.0)
+            ctx.destroy(linger=0)
+            router.close(linger=0)
+            ctx_peer.term()
 
 
 class TestStorageMetricsCollection:
