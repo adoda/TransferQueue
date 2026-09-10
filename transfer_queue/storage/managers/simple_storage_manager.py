@@ -15,6 +15,7 @@
 
 import asyncio
 import os
+import time
 import warnings
 from collections import defaultdict
 from collections.abc import Mapping
@@ -30,7 +31,12 @@ from tensordict import NonTensorStack, TensorDict
 
 from transfer_queue.metadata import BatchMeta, extract_field_schema
 from transfer_queue.storage.managers.base import StorageManager, StorageManagerFactory
-from transfer_queue.storage.simple_storage import KEY_NOT_FOUND_MARKER, StorageKeyNotFoundError
+from transfer_queue.storage.simple_storage import (
+    KEY_NOT_FOUND_MARKER,
+    TQ_STORAGE_LARGE_PAYLOAD_MB,
+    TQ_STORAGE_SLOW_REQUEST_SECONDS,
+    StorageKeyNotFoundError,
+)
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
@@ -429,6 +435,20 @@ class AsyncSimpleStorageManager(StorageManager):
             field_schema,
         )
 
+    def _log_if_heavy_put(
+        self, started: float, serialized_bytes: int, num_samples: int, fields: Any, target_storage_unit: str
+    ) -> None:
+        """Log a put that was slow or unusually large on the wire; stay silent otherwise."""
+        elapsed = time.perf_counter() - started
+        payload_mb = serialized_bytes / 2**20
+        if elapsed < TQ_STORAGE_SLOW_REQUEST_SECONDS and payload_mb < TQ_STORAGE_LARGE_PAYLOAD_MB:
+            return
+        logger.warning(
+            f"[{self.storage_manager_id}]: heavy put to {target_storage_unit} "
+            f"at {self._describe_storage_unit(target_storage_unit)} samples={num_samples} "
+            f"serialized_mb={payload_mb:.1f} elapsed={elapsed:.2f}s fields={list(fields)}"
+        )
+
     @with_storage_unit_socket
     async def _put_to_single_storage_unit(
         self,
@@ -450,6 +470,7 @@ class AsyncSimpleStorageManager(StorageManager):
         )
 
         serialized_bytes = 0
+        started = time.perf_counter()
         try:
             frames = request_msg.serialize()
             serialized_bytes = sum(frame_nbytes(frame) or 0 for frame in frames)
@@ -462,6 +483,9 @@ class AsyncSimpleStorageManager(StorageManager):
                     f"Failed to put data to storage unit {target_storage_unit}: "
                     f"{response_msg.body.get('message', 'Unknown error')}"
                 )
+            self._log_if_heavy_put(
+                started, serialized_bytes, len(global_indexes), storage_data.keys(), target_storage_unit
+            )
         except zmq.error.Again as e:
             raise StorageUnitTimeout(
                 f"no answer in {TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT}s during put to storage unit "

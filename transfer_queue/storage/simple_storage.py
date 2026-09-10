@@ -400,7 +400,10 @@ class SimpleStorageUnit:
         worker_socket.close(linger=0)
 
     def _log_if_heavy(self, operation: str, started: float, field_data: Any, num_samples: int, fields: Any) -> None:
-        """Log a request that was slow or unusually large, and stay silent otherwise."""
+        """Log a get that was slow or unusually large on this unit; stay silent otherwise.
+
+        Put heavy logging lives on the manager, which sees the wire size and end-to-end RTT.
+        """
         elapsed = time.perf_counter() - started
         payload_mb = estimate_payload_bytes(field_data) / 2**20
         if elapsed < TQ_STORAGE_SLOW_REQUEST_SECONDS and payload_mb < TQ_STORAGE_LARGE_PAYLOAD_MB:
@@ -425,7 +428,6 @@ class SimpleStorageUnit:
             field_data = data_parts.body["data"]  # field_data should be a dict.
             data_parser = data_parts.body.get("data_parser", None)
 
-            started = time.perf_counter()
             with limit_pytorch_auto_parallel_threads(
                 target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_put"
             ):
@@ -472,8 +474,6 @@ class SimpleStorageUnit:
                                 f"expected {orig_len}, got {new_len}"
                             )
                 self.storage_data.put_data(field_data, global_indexes)
-
-            self._log_if_heavy("PUT_DATA", started, field_data, len(global_indexes), field_data.keys())
 
             # After put operation finish, send a message to the client
             response_msg = ZMQMessage.create(

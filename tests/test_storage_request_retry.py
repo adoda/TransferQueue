@@ -16,6 +16,7 @@
 """Tests for storage-unit request retry and the timeout diagnosis that classifies a failure."""
 
 import logging
+import time
 from unittest.mock import AsyncMock, patch
 
 import numpy as np
@@ -199,6 +200,22 @@ async def test_retry_logs_timeout_detail(caplog):
 
     warning = next(r for r in caplog.records if "retry" in r.message)
     assert "serialized_mb=12.5" in warning.message
+
+
+def test_manager_logs_heavy_put(caplog):
+    """A put that is large on the wire is logged on the manager, not the unit."""
+    manager = _manager(unit_a=_server_info("unit_a", "10.0.0.7", 5555))
+
+    with (
+        patch.object(ssm, "TQ_STORAGE_LARGE_PAYLOAD_MB", 0.0),
+        patch.object(ssm, "TQ_STORAGE_SLOW_REQUEST_SECONDS", 1e9),
+        caplog.at_level(logging.WARNING),
+    ):
+        manager._log_if_heavy_put(time.perf_counter(), 512 * 2**20, 4, ["input_ids"], "unit_a")
+
+    warning = next(r for r in caplog.records if "heavy put" in r.message)
+    assert "serialized_mb=512.0" in warning.message
+    assert "10.0.0.7:5555" in warning.message
 
 
 @pytest.mark.asyncio
