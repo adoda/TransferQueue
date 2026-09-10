@@ -16,7 +16,6 @@
 """Tests for storage-unit request retry and the timeout diagnosis that classifies a failure."""
 
 import logging
-import time
 from unittest.mock import AsyncMock, patch
 
 import numpy as np
@@ -31,7 +30,7 @@ from transfer_queue.storage.managers.simple_storage_manager import (
     AsyncSimpleStorageManager,
     StorageUnitTimeout,
 )
-from transfer_queue.utils.common import estimate_payload_bytes
+from transfer_queue.utils import common
 from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.zmq_utils import ZMQServerInfo
 
@@ -202,20 +201,30 @@ async def test_retry_logs_timeout_detail(caplog):
     assert "serialized_mb=12.5" in warning.message
 
 
-def test_manager_logs_heavy_put(caplog):
-    """A put that is large on the wire is logged on the manager, not the unit."""
-    manager = _manager(unit_a=_server_info("unit_a", "10.0.0.7", 5555))
-
+def test_log_heavy_operation_reports_the_measured_wire_size(caplog):
+    """Both call sites hand over serialized bytes, so the message reports them as measured."""
     with (
-        patch.object(ssm, "TQ_STORAGE_LARGE_PAYLOAD_MB", 0.0),
-        patch.object(ssm, "TQ_STORAGE_SLOW_REQUEST_SECONDS", 1e9),
+        patch.object(common, "TQ_STORAGE_LARGE_PAYLOAD_MB", 0.0),
+        patch.object(common, "TQ_STORAGE_SLOW_REQUEST_SECONDS", 1e9),
         caplog.at_level(logging.WARNING),
     ):
-        manager._log_if_heavy_put(time.perf_counter(), 512 * 2**20, 4, ["input_ids"], "unit_a")
+        common.log_heavy_operation("TQ_STORAGE_test", "put", 0.25, 512 * 2**20, "to unit_a samples=4")
 
     warning = next(r for r in caplog.records if "heavy put" in r.message)
     assert "serialized_mb=512.0" in warning.message
-    assert "10.0.0.7:5555" in warning.message
+    assert "to unit_a samples=4" in warning.message
+
+
+def test_log_heavy_operation_stays_silent_below_both_thresholds(caplog):
+    """Only requests past a threshold are worth a line; the normal path must not log."""
+    with (
+        patch.object(common, "TQ_STORAGE_LARGE_PAYLOAD_MB", 256.0),
+        patch.object(common, "TQ_STORAGE_SLOW_REQUEST_SECONDS", 5.0),
+        caplog.at_level(logging.WARNING),
+    ):
+        common.log_heavy_operation("TQ_STORAGE_test", "get", 0.01, 2**20, "samples=4")
+
+    assert not caplog.records
 
 
 @pytest.mark.asyncio
@@ -295,18 +304,3 @@ class _Writer:
 
     def close(self):
         pass
-
-
-def test_estimate_payload_bytes_handles_put_and_get_shapes():
-    """Both the batched put shape and the per-sample get shape must be measurable."""
-    batched = {"input_ids": torch.zeros(4, 8, dtype=torch.int64)}
-    per_sample = {"input_ids": [torch.zeros(8, dtype=torch.int64) for _ in range(4)]}
-
-    assert estimate_payload_bytes(batched) == 4 * 8 * 8
-    assert estimate_payload_bytes(per_sample) == 4 * 8 * 8
-
-
-def test_estimate_payload_bytes_degrades_to_zero_on_unmeasurable_input():
-    """Size estimation is diagnostic only and must never break the path it reports on."""
-    assert estimate_payload_bytes(object()) == 0
-    assert estimate_payload_bytes({"meta": "not a tensor"}) == 0

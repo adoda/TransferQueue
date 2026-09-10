@@ -14,9 +14,7 @@
 # limitations under the License.
 
 import os
-from collections.abc import Mapping
 from contextlib import contextmanager
-from typing import Any
 
 import psutil
 import ray
@@ -137,20 +135,25 @@ def get_env_bool(env_key: str, default: bool = False) -> bool:
     return env_value_lower in true_values
 
 
-def estimate_payload_bytes(field_data: Any) -> int:
-    """Best-effort size of a request payload in bytes; 0 when it cannot be measured.
+# Thresholds above which a single request earns a log line. Both sit far above the normal range
+# of single-digit milliseconds, so tripping either one is itself the finding.
+TQ_STORAGE_SLOW_REQUEST_SECONDS = float(os.environ.get("TQ_STORAGE_SLOW_REQUEST_SECONDS", 5.0))
+TQ_STORAGE_LARGE_PAYLOAD_MB = float(os.environ.get("TQ_STORAGE_LARGE_PAYLOAD_MB", 256))
 
-    Walks two levels: covers both put's ``field -> value`` and get's ``field -> per-sample list``.
+
+def log_heavy_operation(component_id: str, operation: str, elapsed: float, payload_bytes: int, detail: str) -> None:
+    """Warn about one slow or unusually large request; stay silent otherwise.
+
+    Args:
+        component_id: Storage manager or storage unit reporting the request.
+        operation: Operation name, e.g. ``put`` or ``get``.
+        elapsed: Wall time spent on the request, in seconds.
+        payload_bytes: Serialized size of the payload on the wire.
+        detail: Request shape, appended to the message verbatim.
     """
-    total = 0
-    try:
-        values = field_data.values() if isinstance(field_data, Mapping) else field_data
-        for value in values:
-            items = value if isinstance(value, list | tuple) else [value]
-            for item in items:
-                nbytes = getattr(item, "nbytes", None)
-                if isinstance(nbytes, int):
-                    total += nbytes
-    except Exception:
-        return 0
-    return total
+    payload_mb = payload_bytes / 2**20
+    if elapsed < TQ_STORAGE_SLOW_REQUEST_SECONDS and payload_mb < TQ_STORAGE_LARGE_PAYLOAD_MB:
+        return
+    logger.warning(
+        f"[{component_id}]: heavy {operation} {detail} serialized_mb={payload_mb:.1f} elapsed={elapsed:.2f}s"
+    )

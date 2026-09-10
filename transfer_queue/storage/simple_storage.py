@@ -25,7 +25,7 @@ import psutil
 import ray
 import zmq
 
-from transfer_queue.utils.common import estimate_payload_bytes, limit_pytorch_auto_parallel_threads
+from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads, log_heavy_operation
 from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.perf_utils import IntervalPerfMonitor
@@ -36,6 +36,7 @@ from transfer_queue.utils.zmq_utils import (
     ZMQServerInfo,
     create_zmq_socket,
     format_zmq_address,
+    frame_nbytes,
     get_free_port,
     get_node_ip_address,
 )
@@ -47,11 +48,6 @@ logger = get_logger(__name__)
 
 TQ_STORAGE_POLLER_TIMEOUT = int(os.environ.get("TQ_STORAGE_POLLER_TIMEOUT", 5))  # in seconds
 TQ_NUM_THREADS = int(os.environ.get("TQ_NUM_THREADS", 8))
-
-# Thresholds above which a single request earns a log line. Both sit far above the normal range
-# of single-digit milliseconds, so tripping either one is itself the finding.
-TQ_STORAGE_SLOW_REQUEST_SECONDS = float(os.environ.get("TQ_STORAGE_SLOW_REQUEST_SECONDS", 5.0))
-TQ_STORAGE_LARGE_PAYLOAD_MB = float(os.environ.get("TQ_STORAGE_LARGE_PAYLOAD_MB", 256))
 
 # Marks a GET_ERROR reply as "the key is gone" so the caller can tell it apart from a real fault.
 KEY_NOT_FOUND_MARKER = "TQKeyNotFound"
@@ -349,6 +345,7 @@ class SimpleStorageUnit:
                     worker_socket.send_multipart([identity] + error_msg.serialize(), copy=False)
                     continue
                 operation = request_msg.request_type
+                started = time.perf_counter()
 
                 try:
                     logger.debug(f"[{self.storage_unit_id}]: worker received operation: {operation}")
@@ -393,25 +390,22 @@ class SimpleStorageUnit:
                     )
 
                 # Send response back with identity for routing
-                worker_socket.send_multipart([identity] + response_msg.serialize(), copy=False)
+                response_frames = response_msg.serialize()
+                if operation == ZMQRequestType.GET_DATA:  # type: ignore[arg-type]
+                    # This end serializes the get response, so its frames give the true wire size.
+                    log_heavy_operation(
+                        self.storage_unit_id,
+                        "get",
+                        time.perf_counter() - started,
+                        sum(frame_nbytes(frame) or 0 for frame in response_frames),
+                        f"samples={len(request_msg.body.get('global_indexes', []))} "
+                        f"fields={list(request_msg.body.get('fields', []))}",
+                    )
+                worker_socket.send_multipart([identity] + response_frames, copy=False)
 
         logger.info(f"[{self.storage_unit_id}]: worker stopped.")
         poller.unregister(worker_socket)
         worker_socket.close(linger=0)
-
-    def _log_if_heavy(self, operation: str, started: float, field_data: Any, num_samples: int, fields: Any) -> None:
-        """Log a get that was slow or unusually large on this unit; stay silent otherwise.
-
-        Put heavy logging lives on the manager, which sees the wire size and end-to-end RTT.
-        """
-        elapsed = time.perf_counter() - started
-        payload_mb = estimate_payload_bytes(field_data) / 2**20
-        if elapsed < TQ_STORAGE_SLOW_REQUEST_SECONDS and payload_mb < TQ_STORAGE_LARGE_PAYLOAD_MB:
-            return
-        logger.warning(
-            f"[{self.storage_unit_id}]: heavy {operation} samples={num_samples} "
-            f"payload_mb={payload_mb:.1f} elapsed={elapsed:.2f}s fields={list(fields)}"
-        )
 
     def _handle_put(self, data_parts: ZMQMessage) -> ZMQMessage:
         """
@@ -507,13 +501,10 @@ class SimpleStorageUnit:
             fields = data_parts.body["fields"]
             global_indexes = data_parts.body["global_indexes"]
 
-            started = time.perf_counter()
             with limit_pytorch_auto_parallel_threads(
                 target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_get"
             ):
                 result_data = self.storage_data.get_data(fields, global_indexes)
-
-            self._log_if_heavy("GET_DATA", started, result_data, len(global_indexes), fields)
 
             response_msg = ZMQMessage.create(
                 request_type=ZMQRequestType.GET_DATA_RESPONSE,  # type: ignore[arg-type]
