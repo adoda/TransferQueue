@@ -387,9 +387,7 @@ class AsyncSimpleStorageManager(StorageManager):
         field_schema = extract_field_schema(data)
 
         routing = self._group_by_hash(metadata.global_indexes)
-        # Replaying a put is safe because it overwrites the same global indexes, but a retry also
-        # re-runs data_parser on the unit, and the public API does not require a parser to be free
-        # of side effects. So a parser-backed put is sent once and fails as it did before.
+        # Parser-backed puts are not replayed: the public API does not constrain parser side effects.
         max_attempts = 1 if data_parser is not None else None
         tasks = []
         for su_id, group in routing.items():
