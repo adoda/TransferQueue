@@ -61,6 +61,8 @@ class StorageUnitTimeout(RuntimeError):
     """A storage unit did not answer within the send/recv timeout.
 
     Distinct from an error the unit reported: only a missing answer is worth a new connection.
+    The message must name the unit, its endpoint and the timeout, because it is what the callers
+    of ``put_data`` and ``get_data`` see, and the retry logs rely on it instead of repeating them.
     """
 
 
@@ -257,7 +259,6 @@ class AsyncSimpleStorageManager(StorageManager):
             max_attempts: Attempts allowed. Defaults to ``TQ_SIMPLE_STORAGE_MAX_ATTEMPTS``; pass 1
                 for a request that must not be replayed.
         """
-        endpoint = self._describe_storage_unit(target_storage_unit)
         # Floored at one: a nonpositive count would skip the request and report success, which for
         # put would publish metadata for data that was never sent.
         attempts_allowed = max(1, TQ_SIMPLE_STORAGE_MAX_ATTEMPTS if max_attempts is None else max_attempts)
@@ -265,17 +266,17 @@ class AsyncSimpleStorageManager(StorageManager):
             try:
                 return await make_request()
             except StorageUnitTimeout as e:
+                # The exception already names the unit, its endpoint and the timeout, so these
+                # lines only add what it cannot know: which attempt this was, and the shape.
                 if attempt < attempts_allowed:
                     logger.warning(
-                        f"[{self.storage_manager_id}]: no answer from {target_storage_unit} at {endpoint} in "
-                        f"{TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT}s, {operation} retry "
-                        f"{attempt + 1}/{attempts_allowed}. {request_context} {e}"
+                        f"[{self.storage_manager_id}]: {operation} retry {attempt + 1}/{attempts_allowed} "
+                        f"on a new connection. {request_context} {e}"
                     )
                     continue
                 logger.error(
-                    f"[{self.storage_manager_id}]: {operation} to {target_storage_unit} at {endpoint} failed "
-                    f"after {attempt}x{TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT}s. {request_context} {e} "
-                    f"{await self._diagnose_storage_unit(target_storage_unit)}"
+                    f"[{self.storage_manager_id}]: {operation} failed after {attempt} attempts. "
+                    f"{request_context} {e} {await self._diagnose_storage_unit(target_storage_unit)}"
                 )
                 raise
 
@@ -482,7 +483,7 @@ class AsyncSimpleStorageManager(StorageManager):
             raise StorageUnitTimeout(
                 f"no answer in {TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT}s during put to storage unit "
                 f"{target_storage_unit} at {self._describe_storage_unit(target_storage_unit)}; "
-                f"samples={len(global_indexes)} serialized_mb={serialized_bytes / 2**20:.1f}"
+                f"serialized_mb={serialized_bytes / 2**20:.1f}"
             ) from e
         except Exception as e:
             logger.error(
@@ -632,7 +633,7 @@ class AsyncSimpleStorageManager(StorageManager):
                 raise error_type(f"Failed to get data from storage unit {target_storage_unit}: {message}")
         except zmq.error.Again as e:
             raise StorageUnitTimeout(
-                f"no answer in {TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT}s from storage unit "
+                f"no answer in {TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT}s during get from storage unit "
                 f"{target_storage_unit} at {self._describe_storage_unit(target_storage_unit)}"
             ) from e
         except StorageKeyNotFoundError:

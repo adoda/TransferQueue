@@ -163,23 +163,24 @@ async def test_errors_reported_by_the_unit_are_not_retried():
 
 
 @pytest.mark.asyncio
-async def test_retry_logs_endpoint_and_request_shape(caplog):
-    """The retry warning must name the endpoint and the request, to correlate both ends."""
+async def test_retry_log_adds_request_shape_without_echoing_the_failure(caplog):
+    """The failure already names the unit and endpoint; the retry line adds shape, not an echo."""
     manager = _manager(unit_a=_server_info("unit_a", "10.0.0.7", 5555))
     attempts = []
 
     async def flaky():
         attempts.append(1)
         if len(attempts) == 1:
-            raise StorageUnitTimeout("no answer")
+            raise StorageUnitTimeout("no answer in 200s during get from storage unit unit_a at 10.0.0.7:5555")
         return "payload"
 
     with caplog.at_level(logging.WARNING):
         await manager._request_with_retry("get", "unit_a", "samples=4 fields=['input_ids']", flaky)
 
     warning = next(r for r in caplog.records if "retry" in r.message)
-    assert "10.0.0.7:5555" in warning.message
-    assert "samples=4" in warning.message
+    assert "samples=4 fields=['input_ids']" in warning.message
+    assert warning.message.count("10.0.0.7:5555") == 1
+    assert warning.message.count("unit_a") == 1
 
 
 @pytest.mark.asyncio
